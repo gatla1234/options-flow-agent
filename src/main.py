@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,8 +47,26 @@ def run_csp() -> None:
 
 def run_eod() -> None:
     run_swing()
-    run_csp()
     grade_open_alerts()
+
+
+def run_scheduled_csp(when: datetime | None = None) -> bool:
+    when = when or now_et()
+    if not is_trading_day(when.date()):
+        return False
+
+    today = str(when.date())
+    windows = (
+        ("csp_morning", dt_time(10, 15), dt_time(11, 0), "morning"),
+        ("csp_afternoon", dt_time(15, 30), dt_time(16, 0), "afternoon"),
+    )
+    for flag, start, end, label in windows:
+        if start <= when.time() < end and get_flag(flag) != today:
+            print(f"Running {label} CSP scan...")
+            run_csp()
+            set_flag(flag, today)
+            return True
+    return False
 
 
 def run_once(kind: str) -> None:
@@ -73,6 +92,7 @@ def loop() -> None:
                 if get_flag("open_ping") != today:
                     _health(f"Market open scan running · {now:%H:%M ET}")
                     set_flag("open_ping", today)
+                run_scheduled_csp(now)
                 run_flow()
                 time.sleep(FLOW_POLL_SECONDS)
             elif is_eod_window(now):

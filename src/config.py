@@ -2,10 +2,10 @@
 
 # ===== Universe =====
 FLOW_TICKERS = [
-    "SPY", "QQQ", "IWM", "TQQQ", "SOXL", "SMH", "IBIT", "BITX", "ASST", "GLD",
+    "SPY", "QQQ", "IWM", "SMH", "IBIT", "GLD",
 ]
-SWING_TICKERS = ["SOXL", "TQQQ", "BITX", "TNA"]
-CSP_TICKERS = ["SOXL", "TQQQ", "BITX", "SPY", "QQQ", "IBIT", "GLD", "SMH"]
+SWING_TICKERS = ["TQQQ", "TNA", "SOXL", "BITX"]
+CSP_TICKERS = ["BITX", "SOXL", "TQQQ"]
 
 # Relative-strength benchmarks for leveraged names
 SWING_BENCHMARKS = {
@@ -36,8 +36,12 @@ CSP_MAX_SPREAD_PCT = 10.0
 CSP_NEAR_SUPPORT_PCT = 3.0
 
 # ===== Options Flow =====
+# Only recommend contracts in the selected DTE and absolute-delta range.
 FLOW_MAX_DTE = 21
+FLOW_MIN_DTE = 7
 FLOW_MAX_EXPIRATIONS = 2
+FLOW_MIN_DELTA = 0.40
+FLOW_MAX_DELTA = 0.55
 FLOW_STRIKE_RANGE_PCT = 12
 FLOW_MIN_PREMIUM = 30_000
 FLOW_MIN_VOLUME = 200
@@ -47,6 +51,9 @@ FLOW_MIN_AGGRESSOR_PCT = 0.60
 FLOW_MAX_SPREAD_PCT = 12.0
 FLOW_POLL_SECONDS = 45
 FLOW_MAX_ALERTS_PER_SCAN = 4
+
+# Underlying quotes used during regular trading hours must be recent.
+FINNHUB_MAX_QUOTE_AGE_SECONDS = 300
 
 # ===== Alerts / runtime =====
 ALERT_COOLDOWN_HOURS = {

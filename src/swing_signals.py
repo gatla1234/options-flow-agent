@@ -20,6 +20,7 @@ from src.config import (
 )
 from src.data import get_daily_bars, get_live_price
 from src.discord_alerts import send_alert
+from src.market import is_rth
 from src.util import as_float, pct_change
 
 
@@ -56,6 +57,74 @@ def _return_pct(df: pl.DataFrame, lookback: int) -> float | None:
     return pct_change(now, then)
 
 
+def underlying_invalidation(
+    ctx: dict | None, direction: str, reference_price: float | None = None
+) -> dict | None:
+    if not ctx:
+        return None
+
+    price = reference_price or as_float(ctx.get("live"))
+    if price <= 0:
+        return None
+
+    levels = ctx.get("levels") or {}
+    if direction == "BULLISH":
+        candidates = [
+            (name, as_float(levels.get(name)))
+            for name in ("ema_slow", "prior_low", "low_20")
+        ]
+        valid = [(name, level) for name, level in candidates if 0 < level < price]
+        if not valid:
+            return None
+        name, level = max(valid, key=lambda item: item[1])
+        return {"price": round(level, 2), "level": name, "condition": "below"}
+
+    if direction == "BEARISH":
+        candidates = [
+            (name, as_float(levels.get(name)))
+            for name in ("ema_slow", "prior_high", "high_20")
+        ]
+        valid = [(name, level) for name, level in candidates if level > price]
+        if not valid:
+            return None
+        name, level = min(valid, key=lambda item: item[1])
+        return {"price": round(level, 2), "level": name, "condition": "above"}
+
+    return None
+
+
+def confirmed_flow_level(
+    ctx: dict | None, right: str, price: float
+) -> dict | None:
+    if not ctx or price <= 0:
+        return None
+
+    levels = ctx.get("levels") or {}
+    if right == "CALL":
+        resistances = [
+            (name, as_float(levels.get(name)))
+            for name in ("prior_high", "high_20")
+        ]
+        valid = [(name, level) for name, level in resistances if 0 < level < price]
+        if not valid:
+            return None
+        name, level = max(valid, key=lambda item: item[1])
+        return {"price": round(level, 2), "level": name, "direction": "BULLISH"}
+
+    if right == "PUT":
+        supports = [
+            (name, as_float(levels.get(name)))
+            for name in ("prior_low", "low_20")
+        ]
+        valid = [(name, level) for name, level in supports if level > price]
+        if not valid:
+            return None
+        name, level = min(valid, key=lambda item: item[1])
+        return {"price": round(level, 2), "level": name, "direction": "BEARISH"}
+
+    return None
+
+
 def build_context(symbol: str) -> dict | None:
     df = _prep(get_daily_bars(symbol))
     if df is None:
@@ -63,7 +132,12 @@ def build_context(symbol: str) -> dict | None:
 
     last = df.tail(1).to_dicts()[0]
     prev = df.tail(2).head(1).to_dicts()[0]
-    live = get_live_price(symbol) or as_float(last["close"])
+    during_rth = is_rth()
+    live = get_live_price(symbol, require_current_day=during_rth)
+    if live is None:
+        if during_rth:
+            return None
+        live = as_float(last["close"])
 
     avg_volume = as_float(last.get("avg_volume"))
     volume = as_float(last.get("volume"))
@@ -157,6 +231,13 @@ def calculate_signals(ctx: dict) -> dict | None:
     else:
         return None
 
+    risk_distance = (
+        live - invalidation if direction == "BULLISH" else invalidation - live
+    )
+    if risk_distance <= 0:
+        return None
+    target = live + 2 * risk_distance if direction == "BULLISH" else live - 2 * risk_distance
+
     confluence = []
     if nearby:
         confluence.append("levels: " + ", ".join(nearby))
@@ -170,6 +251,8 @@ def calculate_signals(ctx: dict) -> dict | None:
         "type": signal_type,
         "direction": direction,
         "invalidation": round(float(invalidation), 2),
+        "target_2r": round(float(target), 2),
+        "risk_reward_ratio": 2.0,
         "confluence": confluence,
     }
 
@@ -187,7 +270,10 @@ def format_swing_description(signal: dict) -> str:
         f"{rs_line}"
         f"**Nearby levels:** {levels}\n"
         f"**Confluence:** {'; '.join(signal['confluence'])}\n"
-        f"**Invalidation:** ${signal['invalidation']}"
+        f"**Underlying invalidation:** ${signal['invalidation']}\n"
+        f"**Suggested take-profit / reassess price (2R reference):** "
+        f"${signal['target_2r']:.2f}\n"
+        f"**Risk:Reward (underlying):** 1:2.0"
     )
 
 

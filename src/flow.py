@@ -14,8 +14,11 @@ from src.config import (
     FLOW_MAX_ALERTS_PER_SCAN,
     FLOW_MAX_DTE,
     FLOW_MAX_EXPIRATIONS,
+    FLOW_MAX_DELTA,
     FLOW_MAX_SPREAD_PCT,
     FLOW_MIN_AGGRESSOR_PCT,
+    FLOW_MIN_DELTA,
+    FLOW_MIN_DTE,
     FLOW_MIN_OI,
     FLOW_MIN_PREMIUM,
     FLOW_MIN_VOLUME,
@@ -26,6 +29,7 @@ from src.config import (
 from src.discord_alerts import send_alert
 from src.options_data import (
     get_expirations,
+    get_greeks_chain,
     get_oi_chain,
     get_ohlc_chain,
     get_option_chain,
@@ -33,7 +37,11 @@ from src.options_data import (
     get_underlying_price,
     join_on_contract,
 )
-from src.swing_signals import build_context
+from src.swing_signals import (
+    build_context,
+    confirmed_flow_level,
+    underlying_invalidation,
+)
 from src.util import as_float, as_int, first_present, normalize_right
 
 
@@ -117,14 +125,20 @@ def scan_symbol(symbol: str, tech: dict | None) -> list[dict]:
 
     print(f"\nScanning {symbol} @ ${price:.2f}")
     results: list[dict] = []
-    expirations = get_expirations(symbol, max_dte=FLOW_MAX_DTE)[:FLOW_MAX_EXPIRATIONS]
+    expirations = get_expirations(
+        symbol, max_dte=FLOW_MAX_DTE, min_dte=FLOW_MIN_DTE
+    )[:FLOW_MAX_EXPIRATIONS]
 
     for exp in expirations:
         quotes = get_option_chain(symbol, exp)
         oi_df = get_oi_chain(symbol, exp)
         ohlc = get_ohlc_chain(symbol, exp)
-        merged = join_on_contract(quotes, oi_df, ohlc)
+        greeks = get_greeks_chain(symbol, exp, stock_price=price)
+        merged = join_on_contract(quotes, oi_df, ohlc, greeks)
         if merged is None:
+            continue
+        dte = (date.fromisoformat(exp) - date.today()).days
+        if not FLOW_MIN_DTE <= dte <= FLOW_MAX_DTE:
             continue
 
         candidates: list[dict] = []
@@ -135,9 +149,12 @@ def scan_symbol(symbol: str, tech: dict | None) -> list[dict]:
             right = normalize_right(first_present(row, "right"))
             oi = as_int(first_present(row, "open_interest", "oi"))
             volume = as_int(first_present(row, "volume", "count"))
+            delta = as_float(first_present(row, "delta", "delta_mid"))
             last = as_float(first_present(row, "close", "price", "last"))
             mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
             if mid <= 0 or strike <= 0 or not right:
+                continue
+            if not FLOW_MIN_DELTA <= abs(delta) <= FLOW_MAX_DELTA:
                 continue
 
             otm_pct = ((strike - price) / price) * 100 if right == "CALL" else ((price - strike) / price) * 100
@@ -160,6 +177,8 @@ def scan_symbol(symbol: str, tech: dict | None) -> list[dict]:
                         "right": right,
                         "strike": strike,
                         "expiration": exp,
+                        "dte": dte,
+                        "delta": delta,
                         "mid": round(mid, 2),
                         "bid": bid,
                         "ask": ask,
@@ -187,22 +206,48 @@ def scan_symbol(symbol: str, tech: dict | None) -> list[dict]:
             aligned, tech_note = _technical_confluence(tech, item["right"])
             if not aligned:
                 continue
+            confirmation = confirmed_flow_level(tech, item["right"], price)
+            if not confirmation:
+                continue
             item["tech_aligned"] = aligned
             item["tech_note"] = tech_note
+            item["confirmation"] = confirmation
+            direction = "BULLISH" if item["right"] == "CALL" else "BEARISH"
+            item["invalidation"] = underlying_invalidation(
+                tech, direction, reference_price=price
+            )
+            if not item["invalidation"]:
+                continue
+            risk_distance = abs(price - item["invalidation"]["price"])
+            if risk_distance <= 0:
+                continue
+            target_price = (
+                price + 2 * risk_distance
+                if direction == "BULLISH"
+                else price - 2 * risk_distance
+            )
+            item["underlying_target_2r"] = round(target_price, 2)
+            item["risk_reward_ratio"] = 2.0
             item["conditions"] = [
                 f"aggressive buy premium ${int(item['buy_premium']):,}",
                 f"vol/OI {item['vol_oi']}x",
                 f"aggressor BUY {item['buy_pct']:.0%}",
-                "technical confluence",
+                f"underlying broke {confirmation['level']}",
             ]
             results.append(item)
 
-    results.sort(key=lambda x: x["buy_premium"], reverse=True)
+    results.sort(
+        key=lambda x: (
+            x["buy_premium"],
+            -abs(abs(x["delta"]) - 0.475),
+        ),
+        reverse=True,
+    )
     return results[:4]
 
 
 def run_flow_scan(send_alerts: bool = True) -> list[dict]:
-    print("Running options flow scan (trades + aggressor + vol/OI)...\n")
+    print("Running confirmed options setup scan (flow + levels + contract filters)...\n")
     all_results: list[dict] = []
     tech_cache: dict[str, dict | None] = {}
 
@@ -235,18 +280,37 @@ def run_flow_scan(send_alerts: bool = True) -> list[dict]:
             color = 0x00FF00 if item["right"] == "CALL" else 0xFF0000
             emoji = "🟢" if item["right"] == "CALL" else "🔴"
             boost = " · CONFLUENCE" if item["tech_aligned"] else ""
-            title = f"{emoji} Aggressive {item['right']} buy — {item['symbol']} {item['strike']}{item['right'][0]}{boost}"
+            title = (
+                f"{emoji} CONFIRMED {item['right']} setup — "
+                f"{item['symbol']} ${item['strike']}{item['right'][0]}{boost}"
+            )
             premium = int(item["buy_premium"])
             description = (
-                f"**Type:** {item['right']} BUY (aggressor {item['buy_pct']:.0%})\n"
-                f"**Strike / Exp:** ${item['strike']} / {item['expiration']}\n"
-                f"**Premium:** ${premium:,} (est tape ${int(item['premium_est']):,})\n"
+                f"**Setup:** {item['right']} option candidate; underlying "
+                f"confirmed above/below {item['confirmation']['level']} "
+                f"${item['confirmation']['price']:.2f}\n"
+                f"**Contract:** ${item['strike']}{item['right'][0]} "
+                f"{item['expiration']} ({item['dte']} DTE) · "
+                f"Delta {item['delta']:+.2f}\n"
+                f"**Option entry reference:** ${item['mid']:.2f} mid "
+                f"(Bid ${item['bid']:.2f} / Ask ${item['ask']:.2f})\n"
+                f"**Max loss:** ~${item['mid'] * 100:,.0f} per contract "
+                f"if bought near mid; no position size assumed\n"
+                f"**Aggressive-buy premium:** ${premium:,}\n"
                 f"**Volume:** {item['volume']:,} vs OI {item['oi']:,} ({item['vol_oi']}x)\n"
-                f"**Mid:** ${item['mid']} (Bid {item['bid']} / Ask {item['ask']})\n"
                 f"**OTM:** {item['otm_pct']}% · **Underlying:** ${item['underlying']:.2f}\n"
                 f"**Tape + tech:** {', '.join(item['conditions'])}\n"
-                f"**Technical:** {item['tech_note']}"
+                f"**Technical:** {item['tech_note']}\n"
+                f"**2R underlying reference target:** "
+                f"${item['underlying_target_2r']:.2f}\n"
+                f"**Risk:Reward (underlying):** 1:2.0"
             )
+            invalidation = item.get("invalidation")
+            if invalidation:
+                description += (
+                    f"\n**Underlying invalidation:** {invalidation['condition']} "
+                    f"${invalidation['price']:.2f} ({invalidation['level']})"
+                )
             send_alert(
                 title=title,
                 description=description,

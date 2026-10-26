@@ -8,9 +8,33 @@ import polars as pl
 from src.flow import _classify_aggressor, scan_symbol
 from src.options_data import get_underlying_price
 from src.csp import find_csp_opportunities
+from datetime import date, timedelta
 
 
 class AggressorClassificationTests(unittest.TestCase):
+    def _expiration(self) -> str:
+        return (date.today() + timedelta(days=14)).isoformat()
+
+    @staticmethod
+    def _greeks(delta: float = 0.45) -> pl.DataFrame:
+        return pl.DataFrame([{"strike": 100.0, "right": "CALL", "delta": delta}])
+
+    @staticmethod
+    def _bullish_technicals() -> dict:
+        return {
+            "trend": "UPTREND",
+            "ok_to_own": True,
+            "nearby_levels": ["ema_slow"],
+            "rs": 0.5,
+            "levels": {
+                "ema_slow": 98.0,
+                "prior_low": 96.0,
+                "low_20": 90.0,
+                "prior_high": 99.0,
+                "high_20": 98.0,
+            },
+        }
+
     def test_csp_scan_fails_closed_without_ownership_context(self) -> None:
         with patch("src.csp.get_underlying_price") as underlying_price:
             results = find_csp_opportunities("SOXL", None)
@@ -58,19 +82,15 @@ class AggressorClassificationTests(unittest.TestCase):
         small_buy_tape = pl.DataFrame(
             [{"price": 1.01, "size": 10, "bid": 0.99, "ask": 1.01}]
         )
-        technicals = {
-            "trend": "UPTREND",
-            "ok_to_own": True,
-            "nearby_levels": ["ema_slow"],
-            "rs": 0.5,
-        }
+        technicals = self._bullish_technicals()
 
         with (
             patch("src.flow.get_underlying_price", return_value=100.0),
-            patch("src.flow.get_expirations", return_value=["2026-11-20"]),
+            patch("src.flow.get_expirations", return_value=[self._expiration()]),
             patch("src.flow.get_option_chain", return_value=quotes),
             patch("src.flow.get_oi_chain", return_value=oi),
             patch("src.flow.get_ohlc_chain", return_value=ohlc),
+            patch("src.flow.get_greeks_chain", return_value=self._greeks()),
             patch("src.flow.get_trade_quotes", return_value=small_buy_tape),
         ):
             results = scan_symbol("SPY", technicals)
@@ -90,19 +110,15 @@ class AggressorClassificationTests(unittest.TestCase):
         buy_tape = pl.DataFrame(
             [{"price": 1.01, "size": 400, "bid": 0.99, "ask": 1.01}]
         )
-        technicals = {
-            "trend": "UPTREND",
-            "ok_to_own": True,
-            "nearby_levels": ["ema_slow"],
-            "rs": 0.5,
-        }
+        technicals = self._bullish_technicals()
 
         with (
             patch("src.flow.get_underlying_price", return_value=100.0),
-            patch("src.flow.get_expirations", return_value=["2026-11-20"]),
+            patch("src.flow.get_expirations", return_value=[self._expiration()]),
             patch("src.flow.get_option_chain", return_value=quotes),
             patch("src.flow.get_oi_chain", return_value=oi),
             patch("src.flow.get_ohlc_chain", return_value=ohlc),
+            patch("src.flow.get_greeks_chain", return_value=self._greeks()),
             patch("src.flow.get_trade_quotes", return_value=buy_tape),
         ):
             results = scan_symbol("SPY", technicals)
@@ -110,6 +126,43 @@ class AggressorClassificationTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["buy_premium"], 40_400)
         self.assertTrue(results[0]["tech_aligned"])
+        self.assertEqual(results[0]["dte"], 14)
+        self.assertEqual(results[0]["delta"], 0.45)
+        self.assertEqual(results[0]["confirmation"]["level"], "prior_high")
+        self.assertEqual(results[0]["underlying_target_2r"], 104.0)
+        self.assertEqual(results[0]["risk_reward_ratio"], 2.0)
+        self.assertEqual(
+            results[0]["invalidation"],
+            {"price": 98.0, "level": "ema_slow", "condition": "below"},
+        )
+
+    def test_contract_outside_delta_range_is_not_recommended(self) -> None:
+        quotes = pl.DataFrame(
+            [{"strike": 100.0, "right": "CALL", "bid": 0.99, "ask": 1.01}]
+        )
+        oi = pl.DataFrame(
+            [{"strike": 100.0, "right": "CALL", "open_interest": 200}]
+        )
+        ohlc = pl.DataFrame(
+            [{"strike": 100.0, "right": "CALL", "volume": 400, "close": 1.0}]
+        )
+        buy_tape = pl.DataFrame(
+            [{"price": 1.01, "size": 400, "bid": 0.99, "ask": 1.01}]
+        )
+
+        with (
+            patch("src.flow.get_underlying_price", return_value=100.0),
+            patch("src.flow.get_expirations", return_value=[self._expiration()]),
+            patch("src.flow.get_option_chain", return_value=quotes),
+            patch("src.flow.get_oi_chain", return_value=oi),
+            patch("src.flow.get_ohlc_chain", return_value=ohlc),
+            patch("src.flow.get_greeks_chain", return_value=self._greeks(0.60)),
+            patch("src.flow.get_trade_quotes", return_value=buy_tape) as trades,
+        ):
+            results = scan_symbol("SPY", self._bullish_technicals())
+
+        self.assertEqual(results, [])
+        trades.assert_not_called()
 
     def test_actual_tape_premium_can_qualify_below_midpoint_estimate(self) -> None:
         quotes = pl.DataFrame(
@@ -124,19 +177,15 @@ class AggressorClassificationTests(unittest.TestCase):
         buy_tape = pl.DataFrame(
             [{"price": 1.20, "size": 263, "bid": 0.99, "ask": 1.01}]
         )
-        technicals = {
-            "trend": "UPTREND",
-            "ok_to_own": True,
-            "nearby_levels": ["ema_slow"],
-            "rs": 0.5,
-        }
+        technicals = self._bullish_technicals()
 
         with (
             patch("src.flow.get_underlying_price", return_value=100.0),
-            patch("src.flow.get_expirations", return_value=["2026-11-20"]),
+            patch("src.flow.get_expirations", return_value=[self._expiration()]),
             patch("src.flow.get_option_chain", return_value=quotes),
             patch("src.flow.get_oi_chain", return_value=oi),
             patch("src.flow.get_ohlc_chain", return_value=ohlc),
+            patch("src.flow.get_greeks_chain", return_value=self._greeks()),
             patch("src.flow.get_trade_quotes", return_value=buy_tape),
         ):
             results = scan_symbol("SPY", technicals)
@@ -161,10 +210,11 @@ class AggressorClassificationTests(unittest.TestCase):
 
         with (
             patch("src.flow.get_underlying_price", return_value=100.0),
-            patch("src.flow.get_expirations", return_value=["2026-11-20"]),
+            patch("src.flow.get_expirations", return_value=[self._expiration()]),
             patch("src.flow.get_option_chain", return_value=quotes),
             patch("src.flow.get_oi_chain", return_value=oi),
             patch("src.flow.get_ohlc_chain", return_value=ohlc),
+            patch("src.flow.get_greeks_chain", return_value=self._greeks()),
             patch("src.flow.get_trade_quotes", return_value=buy_tape),
         ):
             results = scan_symbol("SPY", None)

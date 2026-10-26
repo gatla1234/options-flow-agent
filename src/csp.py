@@ -30,7 +30,7 @@ from src.options_data import (
     get_underlying_price,
     join_on_contract,
 )
-from src.swing_signals import build_context
+from src.swing_signals import build_context, underlying_invalidation
 from src.util import annualized_yield, as_float, first_present, normalize_right
 
 
@@ -103,6 +103,11 @@ def find_csp_opportunities(symbol: str, tech: dict | None) -> list[dict]:
                     continue
 
                 premium = (bid + ask) / 2 if ask > 0 else bid
+                max_profit = premium * 100
+                max_loss = (strike - premium) * 100
+                if max_loss <= 0:
+                    continue
+                reward_risk_ratio = max_profit / max_loss
                 mid = premium
                 spread_pct = ((ask - bid) / mid) * 100 if mid > 0 and ask > 0 else 999
                 otm_pct = ((price - strike) / price) * 100
@@ -147,9 +152,15 @@ def find_csp_opportunities(symbol: str, tech: dict | None) -> list[dict]:
                         "delta": round(delta, 3) if delta else None,
                         "iv": round(iv * 100, 1) if 0 < iv < 5 else (round(iv, 1) if iv else None),
                         "cash_required": cash,
+                        "max_profit": round(max_profit, 2),
+                        "max_loss": round(max_loss, 2),
+                        "reward_risk_ratio": round(reward_risk_ratio, 4),
                         "underlying": price,
                         "support_note": support_note,
                         "near_support": near,
+                        "invalidation": underlying_invalidation(
+                            tech, "BULLISH", reference_price=price
+                        ),
                         "ok_to_own": bool(tech.get("ok_to_own") if tech else True),
                         "trend": tech.get("trend") if tech else "n/a",
                         "score": score,
@@ -196,6 +207,9 @@ def scan_csps(send_to_discord: bool = True) -> list[dict]:
             description = (
                 f"**Expiration:** {op['expiration']} ({op['dte']} DTE)\n"
                 f"**Premium:** ${op['premium']} ({op['premium_pct']}% of strike)\n"
+                f"**Max reward:risk at expiration:** "
+                f"1:{op['max_loss'] / op['max_profit']:.1f} "
+                f"(${op['max_profit']:,.0f} max profit : ${op['max_loss']:,.0f} max loss)\n"
                 f"**Annualized:** {op['annualized']}%\n"
                 f"**Cash required:** ${op['cash_required']:,.0f}\n"
                 f"**OTM:** {op['otm_pct']}% · **Underlying:** ${op['underlying']:.2f}\n"
@@ -204,6 +218,12 @@ def scan_csps(send_to_discord: bool = True) -> list[dict]:
                 f"**Own-shares filter:** {op['trend']} · ok_to_own={op['ok_to_own']}\n"
                 f"**Bid/Ask:** ${op['bid']} / ${op['ask']} ({op['spread_pct']}%)"
             )
+            invalidation = op.get("invalidation")
+            if invalidation:
+                description += (
+                    f"\n**Underlying invalidation:** below "
+                    f"${invalidation['price']:.2f} ({invalidation['level']})"
+                )
             send_alert(
                 title=title,
                 description=description,
