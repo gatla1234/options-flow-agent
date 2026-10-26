@@ -12,14 +12,19 @@ if str(ROOT) not in sys.path:
 
 from rich import print
 
-from src.config import FLOW_POLL_SECONDS
+from src.config import FLOW_POLL_SECONDS, REPORT_EOD_TIME, REPORT_MORNING_TIME
 from src.csp import scan_csps
 from src.discord_alerts import send_alert
+from src.followups import run_price_followups, run_scheduled_followups
 from src.flow import run_flow_scan
 from src.grade import grade_open_alerts
 from src.market import is_eod_window, is_rth, is_trading_day, now_et
+from src.market_reports import build_market_report
 from src.state import get_flag, set_flag
 from src.swing_signals import check_swing_tickers
+
+MORNING_REPORT_TIME = dt_time.fromisoformat(REPORT_MORNING_TIME)
+EOD_REPORT_TIME = dt_time.fromisoformat(REPORT_EOD_TIME)
 
 
 def _health(message: str) -> None:
@@ -69,6 +74,41 @@ def run_scheduled_csp(when: datetime | None = None) -> bool:
     return False
 
 
+def run_scheduled_report(report_type: str, when: datetime | None = None) -> bool:
+    when = when or now_et()
+    if not is_trading_day(when.date()):
+        return False
+
+    today = str(when.date())
+    if report_type == "morning":
+        flag = "market_report_morning"
+        in_window = MORNING_REPORT_TIME <= when.time() < dt_time(9, 30)
+        title = f"Pre-market macro & watchlist — {today}"
+    elif report_type == "eod":
+        flag = "market_report_eod"
+        in_window = EOD_REPORT_TIME <= when.time() <= dt_time(16, 45)
+        title = f"End-of-day market summary — {today}"
+    else:
+        raise ValueError("report_type must be 'morning' or 'eod'")
+
+    if not in_window or get_flag(flag) == today:
+        return False
+
+    run_scheduled_followups(when)
+    description = build_market_report(report_type, when)
+    sent = send_alert(
+        title=title,
+        description=description,
+        color=0x3498DB,
+        alert_type="health",
+        alert_key=f"market-report:{report_type}:{today}",
+        payload={"report_type": report_type, "date": today},
+    )
+    if sent:
+        set_flag(flag, today)
+    return sent
+
+
 def run_once(kind: str) -> None:
     print(f"[cyan]One-shot {kind} at {now_et():%Y-%m-%d %H:%M ET}[/cyan]")
     if kind in {"all", "flow"}:
@@ -83,7 +123,7 @@ def run_once(kind: str) -> None:
 
 def loop() -> None:
     print(f"[cyan]Loop started {now_et():%Y-%m-%d %H:%M ET}[/cyan]")
-    print("Keep the Mac awake during RTH (caffeinate -dimsu) or this process dies on sleep.")
+    print("Keep the Mac awake for scheduled reports and market scans (caffeinate -dimsu).")
     while True:
         now = now_et()
         today = str(now.date())
@@ -94,19 +134,23 @@ def loop() -> None:
                     set_flag("open_ping", today)
                 run_scheduled_csp(now)
                 run_flow()
+                run_price_followups(now)
                 time.sleep(FLOW_POLL_SECONDS)
             elif is_eod_window(now):
+                run_scheduled_report("eod", now)
                 if get_flag("eod_scan") != today:
                     print("Running EOD swing + CSP...")
                     run_eod()
                     set_flag("eod_scan", today)
                     _health(f"EOD swing/CSP pass finished · {now:%H:%M ET}")
                 time.sleep(60)
+            elif is_trading_day(now.date()) and now.time() < dt_time(9, 0):
+                time.sleep(30)
+            elif is_trading_day(now.date()) and now.time() < dt_time(9, 30):
+                run_scheduled_report("morning", now)
+                time.sleep(30)
             else:
-                if is_trading_day(now.date()) and now.hour < 9:
-                    time.sleep(30)
-                else:
-                    time.sleep(120)
+                time.sleep(120)
         except KeyboardInterrupt:
             print("Stopped.")
             return
@@ -134,7 +178,7 @@ def main() -> None:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Run forever: flow in RTH, swing+CSP after the close",
+        help="Run reports at 9:00/16:30 ET, flow in RTH, scheduled CSP, and EOD swing",
     )
     args = parser.parse_args()
     if args.loop:

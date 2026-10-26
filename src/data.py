@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -13,6 +15,13 @@ from src.theta import get_client
 from src.util import as_float, first_present
 
 ET = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class FinnhubQuote:
+    price: float
+    previous_close: float | None
+    timestamp: datetime
 
 
 def get_daily_bars(symbol: str, days: int = LOOKBACK_DAYS) -> pl.DataFrame | None:
@@ -34,7 +43,7 @@ def get_daily_bars(symbol: str, days: int = LOOKBACK_DAYS) -> pl.DataFrame | Non
         return None
 
 
-def _get_finnhub_price(symbol: str, require_current_day: bool) -> float | None:
+def get_finnhub_quote(symbol: str) -> FinnhubQuote | None:
     api_key = os.getenv("FINNHUB_API_KEY")
     if not api_key:
         return None
@@ -62,21 +71,41 @@ def _get_finnhub_price(symbol: str, require_current_day: bool) -> float | None:
     try:
         quote = response.json()
         price = as_float(quote.get("c"))
+        previous_close = as_float(quote.get("pc"))
         timestamp = as_float(quote.get("t"))
-    except (AttributeError, TypeError, ValueError):
+        quoted_at = datetime.fromtimestamp(timestamp, timezone.utc)
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
         print(f"[yellow]Finnhub returned an invalid quote for {symbol}[/yellow]")
         return None
 
-    if price <= 0 or timestamp <= 0:
+    if (
+        not math.isfinite(price)
+        or price <= 0
+        or not math.isfinite(timestamp)
+        or timestamp <= 0
+    ):
         print(f"[yellow]Finnhub returned no usable price for {symbol}[/yellow]")
         return None
 
+    return FinnhubQuote(
+        price,
+        previous_close
+        if math.isfinite(previous_close) and previous_close > 0
+        else None,
+        quoted_at,
+    )
+
+
+def _get_finnhub_price(symbol: str, require_current_day: bool) -> float | None:
+    quote = get_finnhub_quote(symbol)
+    if quote is None:
+        return None
+
     if require_current_day:
-        quote_time = datetime.fromtimestamp(timestamp, timezone.utc)
         now = datetime.now(timezone.utc)
-        age_seconds = (now - quote_time).total_seconds()
+        age_seconds = (now - quote.timestamp).total_seconds()
         if (
-            quote_time.astimezone(ET).date() != now.astimezone(ET).date()
+            quote.timestamp.astimezone(ET).date() != now.astimezone(ET).date()
             or age_seconds < 0
             or age_seconds > FINNHUB_MAX_QUOTE_AGE_SECONDS
         ):
@@ -86,7 +115,7 @@ def _get_finnhub_price(symbol: str, require_current_day: bool) -> float | None:
             )
             return None
 
-    return price
+    return quote.price
 
 
 def get_live_price(

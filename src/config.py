@@ -55,6 +55,16 @@ FLOW_MAX_ALERTS_PER_SCAN = 4
 # Underlying quotes used during regular trading hours must be recent.
 FINNHUB_MAX_QUOTE_AGE_SECONDS = 300
 
+# ===== Scheduled market reports =====
+REPORT_MORNING_TIME = "09:00"
+REPORT_EOD_TIME = "16:30"
+REPORT_FLOW_TICKERS = ["IBIT", "GLD", "SLV", "USO"]
+REPORT_GAP_ALERT_PCT = 2.0
+CSP_GAP_DOWN_ALERT_PCT = 1.5
+FOLLOWUP_MAX_AGE_DAYS = 45
+FOLLOWUP_NEWS_LOOKBACK_HOURS = 24
+FOLLOWUP_PRICE_POLL_SECONDS = 300
+
 # ===== Alerts / runtime =====
 ALERT_COOLDOWN_HOURS = {
     "flow": 4,

@@ -23,6 +23,13 @@ def grade_open_alerts(min_age_hours: float = 20.0) -> None:
         age_hours = (now - created).total_seconds() / 3600
         if age_hours < min_age_hours:
             continue
+        payload = {}
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("is_followup"):
+            continue
         symbol = row["symbol"]
         if not symbol:
             continue
@@ -31,11 +38,6 @@ def grade_open_alerts(min_age_hours: float = 20.0) -> None:
         if not live or not entry:
             continue
         move = pct_change(live, entry)
-        payload = {}
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except json.JSONDecodeError:
-            payload = {}
         direction = str(payload.get("direction") or payload.get("right") or "").upper()
         if "PUT" in direction or direction == "BEARISH":
             helpful = move is not None and move < 0

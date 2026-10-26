@@ -55,7 +55,11 @@ def send_alert(
         embed["fields"] = fields
 
     try:
-        response = requests.post(webhook, json={"embeds": [embed]}, timeout=10)
+        response = requests.post(
+            webhook,
+            json={"embeds": [embed], "allowed_mentions": {"parse": []}},
+            timeout=10,
+        )
         if response.status_code not in (200, 204):
             print(f"[red]Discord error {response.status_code}: {response.text}[/red]")
             return False

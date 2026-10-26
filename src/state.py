@@ -37,6 +37,16 @@ def _connect() -> sqlite3.Connection:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS followup_events (
+            original_alert_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (original_alert_id, event_key)
+        )
+        """
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alerts_key_created ON alerts(alert_key, created_at)"
     )
     conn.commit()
@@ -106,6 +116,71 @@ def ungraded_alerts(alert_type: str | None = None) -> list[dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def alerts_between(
+    alert_type: str, start: datetime, end: datetime
+) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, alert_type, symbol, title, payload, price_at_alert, created_at
+            FROM alerts
+            WHERE alert_type = ? AND created_at >= ? AND created_at < ?
+            ORDER BY created_at
+            """,
+            (
+                alert_type,
+                start.astimezone(timezone.utc).isoformat(),
+                end.astimezone(timezone.utc).isoformat(),
+            ),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def followup_alerts_since(cutoff: datetime) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, alert_type, symbol, title, payload, price_at_alert, created_at
+            FROM alerts
+            WHERE alert_type IN ('flow', 'swing', 'csp') AND created_at >= ?
+            ORDER BY created_at
+            """,
+            (cutoff.astimezone(timezone.utc).isoformat(),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def followup_event_sent(original_alert_id: int, event_key: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM followup_events
+            WHERE original_alert_id = ? AND event_key = ?
+            """,
+            (original_alert_id, event_key),
+        ).fetchone()
+    return row is not None
+
+
+def mark_followup_event_sent(original_alert_id: int, event_key: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO followup_events (
+                original_alert_id, event_key, sent_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                original_alert_id,
+                event_key,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
 
 
 def grade_alert(alert_id: int, outcome: str) -> None:
