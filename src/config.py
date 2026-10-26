@@ -1,0 +1,58 @@
+# src/config.py
+
+# ===== Universe =====
+FLOW_TICKERS = [
+    "SPY", "QQQ", "IWM", "TQQQ", "SOXL", "SMH", "IBIT", "BITX", "ASST", "GLD",
+]
+SWING_TICKERS = ["SOXL", "TQQQ", "BITX", "TNA"]
+CSP_TICKERS = ["SOXL", "TQQQ", "BITX", "SPY", "QQQ", "IBIT", "GLD", "SMH"]
+
+# Relative-strength benchmarks for leveraged names
+SWING_BENCHMARKS = {
+    "SOXL": "SMH",
+    "TQQQ": "QQQ",
+    "BITX": "IBIT",
+    "TNA": "IWM",
+}
+
+# ===== Swing Trade =====
+LOOKBACK_DAYS = 80
+VOLUME_LOOKBACK = 20
+VOLUME_MULTIPLIER = 1.5
+EMA_FAST = 9
+EMA_SLOW = 21
+RS_LOOKBACK = 5
+LEVEL_NEAR_PCT = 1.5
+
+# ===== Cash-Secured Put =====
+CSP_MAX_DTE = 45
+CSP_MIN_DTE = 5
+CSP_MAX_EXPIRATIONS = 4
+CSP_MIN_PREMIUM_PCT = 0.4
+CSP_MAX_OTM_PCT = 12.0
+CSP_MIN_DELTA = -0.35
+CSP_MAX_DELTA = -0.15
+CSP_MAX_SPREAD_PCT = 10.0
+CSP_NEAR_SUPPORT_PCT = 3.0
+
+# ===== Options Flow =====
+FLOW_MAX_DTE = 21
+FLOW_MAX_EXPIRATIONS = 2
+FLOW_STRIKE_RANGE_PCT = 12
+FLOW_MIN_PREMIUM = 30_000
+FLOW_MIN_VOLUME = 200
+FLOW_VOLUME_OI_RATIO = 1.5
+FLOW_MIN_OI = 50
+FLOW_MIN_AGGRESSOR_PCT = 0.60
+FLOW_MAX_SPREAD_PCT = 12.0
+FLOW_POLL_SECONDS = 45
+FLOW_MAX_ALERTS_PER_SCAN = 4
+
+# ===== Alerts / runtime =====
+ALERT_COOLDOWN_HOURS = {
+    "flow": 4,
+    "swing": 20,
+    "csp": 20,
+    "health": 12,
+}
+MAX_DISCORD_ALERTS_PER_MINUTE = 8

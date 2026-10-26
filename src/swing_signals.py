@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import polars as pl
+from rich import print
+
+from src.config import (
+    EMA_FAST,
+    EMA_SLOW,
+    LEVEL_NEAR_PCT,
+    RS_LOOKBACK,
+    SWING_BENCHMARKS,
+    SWING_TICKERS,
+    VOLUME_LOOKBACK,
+    VOLUME_MULTIPLIER,
+)
+from src.data import get_daily_bars, get_live_price
+from src.discord_alerts import send_alert
+from src.util import as_float, pct_change
+
+
+def _prep(df: pl.DataFrame) -> pl.DataFrame | None:
+    needed = {"close", "high", "low", "volume"}
+    if df is None or df.is_empty() or not needed.issubset(set(df.columns)):
+        return None
+    sort_col = "created" if "created" in df.columns else df.columns[0]
+    df = df.sort(sort_col)
+    if len(df) < VOLUME_LOOKBACK + 5:
+        return None
+    return df.with_columns(
+        [
+            pl.col("close").ewm_mean(span=EMA_FAST).alias("ema_fast"),
+            pl.col("close").ewm_mean(span=EMA_SLOW).alias("ema_slow"),
+            pl.col("volume").shift(1).rolling_mean(window_size=VOLUME_LOOKBACK).alias("avg_volume"),
+            pl.col("high").shift(1).rolling_max(window_size=20).alias("high_20"),
+            pl.col("low").shift(1).rolling_min(window_size=20).alias("low_20"),
+        ]
+    )
+
+
+def _near(price: float, level: float | None, pct: float = LEVEL_NEAR_PCT) -> bool:
+    if not level:
+        return False
+    return abs((price - level) / level) * 100 <= pct
+
+
+def _return_pct(df: pl.DataFrame, lookback: int) -> float | None:
+    if len(df) <= lookback:
+        return None
+    now = as_float(df.tail(1)["close"][0])
+    then = as_float(df.tail(lookback + 1).head(1)["close"][0])
+    return pct_change(now, then)
+
+
+def build_context(symbol: str) -> dict | None:
+    df = _prep(get_daily_bars(symbol))
+    if df is None:
+        return None
+
+    last = df.tail(1).to_dicts()[0]
+    prev = df.tail(2).head(1).to_dicts()[0]
+    live = get_live_price(symbol) or as_float(last["close"])
+
+    avg_volume = as_float(last.get("avg_volume"))
+    volume = as_float(last.get("volume"))
+    volume_ratio = (volume / avg_volume) if avg_volume else 0.0
+    ema_fast = as_float(last.get("ema_fast"))
+    ema_slow = as_float(last.get("ema_slow"))
+
+    levels = {
+        "prior_high": as_float(prev.get("high")),
+        "prior_low": as_float(prev.get("low")),
+        "prior_close": as_float(prev.get("close")),
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "high_20": as_float(last.get("high_20")),
+        "low_20": as_float(last.get("low_20")),
+    }
+    nearby = [name for name, level in levels.items() if _near(live, level)]
+
+    benchmark = SWING_BENCHMARKS.get(symbol)
+    rs = None
+    if benchmark:
+        bench_df = _prep(get_daily_bars(benchmark))
+        if bench_df is not None:
+            sym_ret = _return_pct(df, RS_LOOKBACK)
+            bench_ret = _return_pct(bench_df, RS_LOOKBACK)
+            if sym_ret is not None and bench_ret is not None:
+                rs = round(sym_ret - bench_ret, 2)
+
+    trend = "NEUTRAL"
+    if live > ema_fast > ema_slow:
+        trend = "UPTREND"
+    elif live < ema_fast < ema_slow:
+        trend = "DOWNTREND"
+
+    ok_to_own = trend != "DOWNTREND" and (levels["low_20"] == 0 or live >= levels["low_20"] * 0.97)
+
+    return {
+        "symbol": symbol,
+        "close": as_float(last["close"]),
+        "live": live,
+        "ema_fast": round(ema_fast, 2),
+        "ema_slow": round(ema_slow, 2),
+        "volume": int(volume),
+        "avg_volume": int(avg_volume),
+        "volume_ratio": round(volume_ratio, 2),
+        "levels": levels,
+        "nearby_levels": nearby,
+        "rs": rs,
+        "benchmark": benchmark,
+        "trend": trend,
+        "ok_to_own": ok_to_own,
+    }
+
+
+def calculate_signals(ctx: dict) -> dict | None:
+    live = ctx["live"]
+    ema_fast = ctx["ema_fast"]
+    ema_slow = ctx["ema_slow"]
+    volume_ratio = ctx["volume_ratio"]
+    rs = ctx["rs"]
+    nearby = ctx["nearby_levels"]
+    levels = ctx["levels"]
+    strong_volume = volume_ratio >= VOLUME_MULTIPLIER
+    decent_volume = volume_ratio >= 1.2
+    bullish_rs = rs is None or rs >= 0
+    bearish_rs = rs is None or rs <= 0
+
+    distance_to_slow = ((live - ema_slow) / ema_slow) * 100 if ema_slow else 0
+
+    if live > ema_fast > ema_slow and strong_volume and bullish_rs:
+        signal_type, direction = "STRONG UPTREND", "BULLISH"
+        invalidation = min(ema_slow, levels["prior_low"] or ema_slow)
+    elif (
+        -4.0 < distance_to_slow < 1.0
+        and decent_volume
+        and live > ema_fast * 0.98
+        and (nearby or bullish_rs)
+    ):
+        signal_type, direction = "SUPPORT BOUNCE", "BULLISH"
+        invalidation = min(ema_slow * 0.98, levels["low_20"] or ema_slow)
+    elif live < ema_fast < ema_slow and strong_volume and bearish_rs:
+        signal_type, direction = "STRONG DOWNTREND", "BEARISH"
+        invalidation = max(ema_slow, levels["prior_high"] or ema_slow)
+    elif (
+        live < (levels["prior_low"] or live)
+        and strong_volume
+        and ctx["trend"] != "UPTREND"
+    ):
+        signal_type, direction = "BREAKDOWN", "BEARISH"
+        invalidation = levels["prior_high"] or ema_fast
+    else:
+        return None
+
+    confluence = []
+    if nearby:
+        confluence.append("levels: " + ", ".join(nearby))
+    if rs is not None:
+        confluence.append(f"RS vs {ctx['benchmark']}: {rs:+.1f}%")
+    confluence.append(f"volume {volume_ratio:.2f}x")
+    confluence.append(ctx["trend"].lower())
+
+    return {
+        **ctx,
+        "type": signal_type,
+        "direction": direction,
+        "invalidation": round(float(invalidation), 2),
+        "confluence": confluence,
+    }
+
+
+def format_swing_description(signal: dict) -> str:
+    rs_line = ""
+    if signal.get("rs") is not None:
+        rs_line = f"**RS vs {signal['benchmark']}:** {signal['rs']:+.1f}% (5d)\n"
+    levels = ", ".join(signal["nearby_levels"]) if signal["nearby_levels"] else "none nearby"
+    return (
+        f"**Direction:** {signal['direction']}\n"
+        f"**Price:** ${signal['live']:.2f} (EOD ${signal['close']:.2f})\n"
+        f"**9 EMA:** ${signal['ema_fast']} · **21 EMA:** ${signal['ema_slow']}\n"
+        f"**Volume:** {signal['volume']:,} ({signal['volume_ratio']}x avg)\n"
+        f"{rs_line}"
+        f"**Nearby levels:** {levels}\n"
+        f"**Confluence:** {'; '.join(signal['confluence'])}\n"
+        f"**Invalidation:** ${signal['invalidation']}"
+    )
+
+
+def check_swing_tickers(send_alerts: bool = True) -> list[dict]:
+    print("Checking swing tickers...\n")
+    signals: list[dict] = []
+
+    for symbol in SWING_TICKERS:
+        try:
+            ctx = build_context(symbol)
+            if not ctx:
+                print(f"{symbol}: not enough data")
+                continue
+            signal = calculate_signals(ctx)
+            print(f"{symbol}:")
+            print(f"  Live:       ${ctx['live']:.2f}")
+            print(f"  9/21 EMA:   ${ctx['ema_fast']} / ${ctx['ema_slow']}")
+            print(f"  Volume:     {ctx['volume_ratio']}x  Trend: {ctx['trend']}")
+            print(f"  RS:         {ctx['rs']}")
+            print(f"  Signal:     {signal['type'] if signal else 'No'}")
+            print("-" * 40)
+
+            if not signal:
+                continue
+            signals.append(signal)
+            if send_alerts:
+                color = 0x00FF00 if signal["direction"] == "BULLISH" else 0xFF0000
+                emoji = "🚀" if signal["direction"] == "BULLISH" else "📉"
+                send_alert(
+                    title=f"{emoji} {signal['type']} — {symbol}",
+                    description=format_swing_description(signal),
+                    color=color,
+                    alert_type="swing",
+                    alert_key=f"swing:{symbol}:{signal['type']}:{signal['direction']}",
+                    symbol=symbol,
+                    price=signal["live"],
+                    payload=signal,
+                )
+        except Exception as e:
+            print(f"Error checking {symbol}: {e}")
+
+    return signals
+
+
+if __name__ == "__main__":
+    check_swing_tickers()
