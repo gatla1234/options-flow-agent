@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,12 +16,14 @@ from src.config import (
     RS_LOOKBACK,
     SWING_BENCHMARKS,
     SWING_TICKERS,
+    VOLUME_DECENT_MULTIPLIER,
     VOLUME_LOOKBACK,
     VOLUME_MULTIPLIER,
 )
-from src.data import get_daily_bars, get_live_price
+from src.data import ET, get_daily_bars, get_live_price
 from src.discord_alerts import send_alert
 from src.market import is_rth
+from src.state import log_funnel_scan
 from src.util import as_float, pct_change
 
 
@@ -41,6 +44,28 @@ def _prep(df: pl.DataFrame) -> pl.DataFrame | None:
             pl.col("low").shift(1).rolling_min(window_size=20).alias("low_20"),
         ]
     )
+
+
+def _bar_date(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _latest_completed_bar(df: pl.DataFrame) -> dict | None:
+    if "created" not in df.columns:
+        return None
+    today = datetime.now(ET).date()
+    for row in reversed(df.to_dicts()):
+        bar_date = _bar_date(row.get("created"))
+        if bar_date is not None and bar_date < today:
+            return row
+    return None
 
 
 def _near(price: float, level: float | None, pct: float = LEVEL_NEAR_PCT) -> bool:
@@ -154,6 +179,7 @@ def build_context(symbol: str) -> dict | None:
         "high_20": as_float(last.get("high_20")),
         "low_20": as_float(last.get("low_20")),
     }
+    prior_completed_bar = _latest_completed_bar(df)
     nearby = [name for name, level in levels.items() if _near(live, level)]
 
     benchmark = SWING_BENCHMARKS.get(symbol)
@@ -184,6 +210,16 @@ def build_context(symbol: str) -> dict | None:
         "avg_volume": int(avg_volume),
         "volume_ratio": round(volume_ratio, 2),
         "levels": levels,
+        "prior_day_high": (
+            as_float(prior_completed_bar.get("high"))
+            if prior_completed_bar
+            else None
+        ),
+        "prior_day_low": (
+            as_float(prior_completed_bar.get("low"))
+            if prior_completed_bar
+            else None
+        ),
         "nearby_levels": nearby,
         "rs": rs,
         "benchmark": benchmark,
@@ -192,7 +228,9 @@ def build_context(symbol: str) -> dict | None:
     }
 
 
-def calculate_signals(ctx: dict) -> dict | None:
+def calculate_signals(
+    ctx: dict, funnel: dict[str, int] | None = None
+) -> dict | None:
     live = ctx["live"]
     ema_fast = ctx["ema_fast"]
     ema_slow = ctx["ema_slow"]
@@ -201,28 +239,94 @@ def calculate_signals(ctx: dict) -> dict | None:
     nearby = ctx["nearby_levels"]
     levels = ctx["levels"]
     strong_volume = volume_ratio >= VOLUME_MULTIPLIER
-    decent_volume = volume_ratio >= 1.2
+    decent_volume = volume_ratio >= VOLUME_DECENT_MULTIPLIER
     bullish_rs = rs is None or rs >= 0
     bearish_rs = rs is None or rs <= 0
 
     distance_to_slow = ((live - ema_slow) / ema_slow) * 100 if ema_slow else 0
-
-    if live > ema_fast > ema_slow and strong_volume and bullish_rs:
-        signal_type, direction = "STRONG UPTREND", "BULLISH"
-        invalidation = min(ema_slow, levels["prior_low"] or ema_slow)
-    elif (
+    uptrend_alignment = live > ema_fast > ema_slow
+    downtrend_alignment = live < ema_fast < ema_slow
+    support_price_confirmation = (
         -4.0 < distance_to_slow < 1.0
-        and decent_volume
         and live > ema_fast * 0.98
         and (nearby or bullish_rs)
-    ):
+    )
+    breakdown_price_confirmation = live < (levels["prior_low"] or live)
+
+    if funnel is not None:
+        paths = (
+            (
+                uptrend_alignment,
+                strong_volume,
+                bullish_rs,
+                True,
+                min(ema_slow, levels["prior_low"] or ema_slow),
+                "BULLISH",
+            ),
+            (
+                True,
+                decent_volume,
+                True,
+                support_price_confirmation,
+                min(ema_slow * 0.98, levels["low_20"] or ema_slow),
+                "BULLISH",
+            ),
+            (
+                downtrend_alignment,
+                strong_volume,
+                bearish_rs,
+                True,
+                max(ema_slow, levels["prior_high"] or ema_slow),
+                "BEARISH",
+            ),
+            (
+                ctx["trend"] != "UPTREND",
+                strong_volume,
+                True,
+                breakdown_price_confirmation,
+                levels["prior_high"] or ema_fast,
+                "BEARISH",
+            ),
+        )
+        stage_counts = {
+            "candidates": len(paths),
+            "trend": sum(1 for path in paths if path[0]),
+            "volume": sum(1 for path in paths if path[0] and path[1]),
+            "relative_strength": sum(
+                1 for path in paths if path[0] and path[1] and path[2]
+            ),
+            "confirmation": sum(
+                1
+                for path in paths
+                if path[0] and path[1] and path[2] and path[3]
+            ),
+            "risk_reward": sum(
+                1
+                for path in paths
+                if path[0]
+                and path[1]
+                and path[2]
+                and path[3]
+                and (
+                    live - path[4] > 0
+                    if path[5] == "BULLISH"
+                    else path[4] - live > 0
+                )
+            ),
+        }
+        funnel.update(stage_counts)
+
+    if uptrend_alignment and strong_volume and bullish_rs:
+        signal_type, direction = "STRONG UPTREND", "BULLISH"
+        invalidation = min(ema_slow, levels["prior_low"] or ema_slow)
+    elif support_price_confirmation and decent_volume:
         signal_type, direction = "SUPPORT BOUNCE", "BULLISH"
         invalidation = min(ema_slow * 0.98, levels["low_20"] or ema_slow)
-    elif live < ema_fast < ema_slow and strong_volume and bearish_rs:
+    elif downtrend_alignment and strong_volume and bearish_rs:
         signal_type, direction = "STRONG DOWNTREND", "BEARISH"
         invalidation = max(ema_slow, levels["prior_high"] or ema_slow)
     elif (
-        live < (levels["prior_low"] or live)
+        breakdown_price_confirmation
         and strong_volume
         and ctx["trend"] != "UPTREND"
     ):
@@ -262,7 +366,13 @@ def format_swing_description(signal: dict) -> str:
     if signal.get("rs") is not None:
         rs_line = f"**RS vs {signal['benchmark']}:** {signal['rs']:+.1f}% (5d)\n"
     levels = ", ".join(signal["nearby_levels"]) if signal["nearby_levels"] else "none nearby"
+    suggestion = (
+        f"Suggestion: consider long {signal['symbol']}."
+        if signal["direction"] == "BULLISH"
+        else f"Suggestion: consider short {signal['symbol']}."
+    )
     return (
+        f"{suggestion}\n"
         f"**Direction:** {signal['direction']}\n"
         f"**Price:** ${signal['live']:.2f} (EOD ${signal['close']:.2f})\n"
         f"**9 EMA:** ${signal['ema_fast']} · **21 EMA:** ${signal['ema_slow']}\n"
@@ -271,7 +381,7 @@ def format_swing_description(signal: dict) -> str:
         f"**Nearby levels:** {levels}\n"
         f"**Confluence:** {'; '.join(signal['confluence'])}\n"
         f"**Underlying invalidation:** ${signal['invalidation']}\n"
-        f"**Suggested take-profit / reassess price (2R reference):** "
+        f"**2R underlying reference target:** "
         f"${signal['target_2r']:.2f}\n"
         f"**Risk:Reward (underlying):** 1:2.0"
     )
@@ -282,20 +392,45 @@ def check_swing_tickers(send_alerts: bool = True) -> list[dict]:
     signals: list[dict] = []
 
     for symbol in SWING_TICKERS:
+        counts: dict[str, int] = {}
+        data_available = False
+        funnel_persist_attempted = False
         try:
             ctx = build_context(symbol)
             if not ctx:
                 print(f"{symbol}: not enough data")
-                continue
-            signal = calculate_signals(ctx)
+                signal = None
+            else:
+                data_available = True
+                signal = calculate_signals(ctx, funnel=counts)
             print(f"{symbol}:")
-            print(f"  Live:       ${ctx['live']:.2f}")
-            print(f"  9/21 EMA:   ${ctx['ema_fast']} / ${ctx['ema_slow']}")
-            print(f"  Volume:     {ctx['volume_ratio']}x  Trend: {ctx['trend']}")
-            print(f"  RS:         {ctx['rs']}")
+            if ctx:
+                print(f"  Live:       ${ctx['live']:.2f}")
+                print(f"  9/21 EMA:   ${ctx['ema_fast']} / ${ctx['ema_slow']}")
+                print(f"  Volume:     {ctx['volume_ratio']}x  Trend: {ctx['trend']}")
+                print(f"  RS:         {ctx['rs']}")
             print(f"  Signal:     {signal['type'] if signal else 'No'}")
             print("-" * 40)
 
+            try:
+                funnel_persist_attempted = True
+                log_funnel_scan(
+                    "swing",
+                    symbol,
+                    counts,
+                    data_available=data_available,
+                )
+            except Exception as exc:
+                print(f"[red]Could not persist swing funnel for {symbol}: {exc}[/red]")
+            print(
+                f"[cyan]Swing {symbol} funnel[/cyan] "
+                f"candidates={counts.get('candidates', 0)} "
+                f"trend={counts.get('trend', 0)} "
+                f"volume={counts.get('volume', 0)} "
+                f"relative-strength={counts.get('relative_strength', 0)} "
+                f"confirmation={counts.get('confirmation', 0)} "
+                f"risk/reward={counts.get('risk_reward', 0)}"
+            )
             if not signal:
                 continue
             signals.append(signal)
@@ -309,11 +444,16 @@ def check_swing_tickers(send_alerts: bool = True) -> list[dict]:
                     alert_type="swing",
                     alert_key=f"swing:{symbol}:{signal['type']}:{signal['direction']}",
                     symbol=symbol,
-                    price=signal["live"],
+                    price=signal["close"],
                     payload=signal,
                 )
         except Exception as e:
             print(f"Error checking {symbol}: {e}")
+            if not funnel_persist_attempted:
+                try:
+                    log_funnel_scan("swing", symbol, counts, data_available=False)
+                except Exception as log_exc:
+                    print(f"[red]Could not persist swing funnel for {symbol}: {log_exc}[/red]")
 
     return signals
 

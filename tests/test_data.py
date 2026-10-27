@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import requests
 import polars as pl
 
-from src.data import get_live_price
+from src.data import ET, get_live_price
 from src.swing_signals import build_context
 
 
@@ -63,7 +63,9 @@ class LivePriceTests(unittest.TestCase):
     def test_falls_back_to_theta_when_finnhub_is_not_configured(self) -> None:
         trades = Mock()
         trades.is_empty.return_value = False
-        trades.tail.return_value.to_dicts.return_value = [{"price": 500.5}]
+        trades.tail.return_value.to_dicts.return_value = [
+            {"price": 500.5, "created": datetime.now(ET)}
+        ]
         client = Mock()
         client.stock_snapshot_trade.return_value = trades
 
@@ -81,7 +83,9 @@ class LivePriceTests(unittest.TestCase):
     def test_falls_back_to_theta_when_finnhub_request_fails(self) -> None:
         trades = Mock()
         trades.is_empty.return_value = False
-        trades.tail.return_value.to_dicts.return_value = [{"price": 499.75}]
+        trades.tail.return_value.to_dicts.return_value = [
+            {"price": 499.75, "created": datetime.now(ET)}
+        ]
         client = Mock()
         client.stock_snapshot_trade.return_value = trades
 
@@ -97,6 +101,48 @@ class LivePriceTests(unittest.TestCase):
 
         self.assertEqual(price, 499.75)
         client.stock_snapshot_trade.assert_called_once()
+
+    def test_rejects_stale_theta_trade_and_quote_snapshots(self) -> None:
+        stale = datetime.now(ET) - timedelta(minutes=10)
+        trades = Mock()
+        trades.is_empty.return_value = False
+        trades.tail.return_value.to_dicts.return_value = [
+            {"price": 500.5, "created": stale}
+        ]
+        quotes = Mock()
+        quotes.is_empty.return_value = False
+        quotes.tail.return_value.to_dicts.return_value = [
+            {"bid": 500.0, "ask": 501.0, "created": stale}
+        ]
+        client = Mock()
+        client.stock_snapshot_trade.return_value = trades
+        client.stock_snapshot_quote.return_value = quotes
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("src.data.get_client", return_value=client),
+        ):
+            price = get_live_price("SPY", require_current_day=True)
+
+        self.assertIsNone(price)
+
+    def test_rejects_untimestamped_theta_snapshot(self) -> None:
+        trades = Mock()
+        trades.is_empty.return_value = False
+        trades.tail.return_value.to_dicts.return_value = [{"price": 500.5}]
+        quotes = Mock()
+        quotes.is_empty.return_value = True
+        client = Mock()
+        client.stock_snapshot_trade.return_value = trades
+        client.stock_snapshot_quote.return_value = quotes
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("src.data.get_client", return_value=client),
+        ):
+            price = get_live_price("SPY", require_current_day=True)
+
+        self.assertIsNone(price)
 
     def test_swing_context_does_not_use_eod_price_as_intraday_price(self) -> None:
         daily_bars = pl.DataFrame(

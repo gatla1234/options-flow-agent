@@ -118,6 +118,63 @@ def _get_finnhub_price(symbol: str, require_current_day: bool) -> float | None:
     return quote.price
 
 
+def _snapshot_timestamp(row: dict) -> datetime | None:
+    for key in ("timestamp", "datetime", "created", "date_time", "time"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=ET) if value.tzinfo is None else value
+        if isinstance(value, (int, float)):
+            try:
+                epoch = value / 1000 if value > 10_000_000_000 else value
+                return datetime.fromtimestamp(epoch, timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                continue
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if "T" not in value and " " not in value:
+                continue
+            return parsed.replace(tzinfo=ET) if parsed.tzinfo is None else parsed
+
+    snapshot_date = row.get("date")
+    milliseconds = row.get("ms_of_day")
+    if snapshot_date is not None and milliseconds is not None:
+        try:
+            day = (
+                snapshot_date
+                if isinstance(snapshot_date, date)
+                else date.fromisoformat(str(snapshot_date)[:10])
+            )
+            ms = int(milliseconds)
+            if ms < 0 or ms >= 24 * 60 * 60 * 1000:
+                return None
+            seconds, millis = divmod(ms, 1000)
+            return datetime.combine(day, datetime.min.time(), ET).replace(
+                hour=seconds // 3600,
+                minute=(seconds % 3600) // 60,
+                second=seconds % 60,
+                microsecond=millis * 1000,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
+def _is_fresh_intraday_snapshot(row: dict, now: datetime) -> bool:
+    timestamp = _snapshot_timestamp(row)
+    if timestamp is None:
+        return False
+    now_utc = now.astimezone(timezone.utc)
+    timestamp_utc = timestamp.astimezone(timezone.utc)
+    age_seconds = (now_utc - timestamp_utc).total_seconds()
+    return (
+        timestamp.astimezone(ET).date() == now.astimezone(ET).date()
+        and 0 <= age_seconds <= FINNHUB_MAX_QUOTE_AGE_SECONDS
+    )
+
+
 def get_live_price(
     symbol: str, require_current_day: bool = False
 ) -> float | None:
@@ -127,6 +184,7 @@ def get_live_price(
         return finnhub_price
 
     client = get_client()
+    now = datetime.now(timezone.utc)
     try:
         trades = client.stock_snapshot_trade(
             symbol=symbol, current_day_only=require_current_day
@@ -134,8 +192,12 @@ def get_live_price(
         if trades is not None and not trades.is_empty():
             row = trades.tail(1).to_dicts()[0]
             price = as_float(first_present(row, "price", "close", "last"))
-            if price > 0:
+            if price > 0 and (
+                not require_current_day or _is_fresh_intraday_snapshot(row, now)
+            ):
                 return price
+            if require_current_day:
+                print(f"[yellow]ThetaData trade snapshot for {symbol} is stale or untimestamped[/yellow]")
     except Exception as e:
         print(f"[yellow]Live trade miss {symbol}: {e}[/yellow]")
 
@@ -147,11 +209,16 @@ def get_live_price(
             row = quotes.tail(1).to_dicts()[0]
             bid = as_float(first_present(row, "bid"))
             ask = as_float(first_present(row, "ask"))
-            if bid > 0 and ask > 0:
+            is_fresh = (
+                not require_current_day or _is_fresh_intraday_snapshot(row, now)
+            )
+            if bid > 0 and ask > 0 and is_fresh:
                 return (bid + ask) / 2
             last = as_float(first_present(row, "price", "close", "last"))
-            if last > 0:
+            if last > 0 and is_fresh:
                 return last
+            if require_current_day and not is_fresh:
+                print(f"[yellow]ThetaData quote snapshot for {symbol} is stale or untimestamped[/yellow]")
     except Exception as e:
         print(f"[yellow]Live quote miss {symbol}: {e}[/yellow]")
 

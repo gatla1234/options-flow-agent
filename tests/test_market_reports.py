@@ -62,6 +62,7 @@ class MarketReportContentTests(unittest.TestCase):
         self.assertIn("No specific catalyst is attributed", report)
         self.assertIn("pre-market options-tape feed is available", report)
         self.assertIn("Pre-market IV repricing cannot be verified", report)
+        self.assertNotIn("Suggestion:", report)
 
     def test_macro_news_filters_to_recent_source_backed_catalysts(self) -> None:
         now = datetime(2026, 10, 26, 9, 0, tzinfo=ET)
