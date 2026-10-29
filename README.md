@@ -73,7 +73,17 @@ python -m src.main --once csp
 python -m src.main --once grade
 ```
 
-Start the continuous scheduler:
+Start the application (continuous scheduler):
+
+```sh
+cd /Users/vineelamuddana/options-flow-agent
+caffeinate -dimsu venv/bin/python run.py --loop
+```
+
+Run these two lines from any directory. The first changes into the project
+root; the second uses the project virtualenv, keeps the Mac awake with
+`caffeinate -dimsu`, and starts the loop. Equivalent command with the virtual
+environment already activated:
 
 ```sh
 python -m src.main --loop
@@ -91,10 +101,10 @@ configured market holidays are skipped. Scheduled early closes end the
 underlying session at 1:00 p.m. ET and the options board at 1:15 p.m.; the
 afternoon CSP window is skipped if it would begin after that close. The
 explicit holiday and early-close calendar in `src/market.py` is maintained
-through 2027 and must be updated before each subsequent calendar year. Keep the process
-running and the computer awake for scheduled alerts. On macOS, run
-`caffeinate -dimsu` in another terminal to keep the machine awake while the
-loop is active.
+through 2027 and must be updated before each subsequent calendar year. Keep the
+process running and the computer awake for scheduled alerts; the start command
+above already handles the `caffeinate` part, so leave that terminal open while
+the loop is active.
 
 The open-alert board updates every 15 minutes until 4:15 p.m. ET (1:15 p.m.
 on configured early-close days). The daily
